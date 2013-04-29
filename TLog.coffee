@@ -46,7 +46,7 @@ class TLog
   # @param [Bool] want_to_print if true, log messages will be printed to the console as well
   #
   @getLogger:->
-    @_instance?=new TLog TLog.LOGLEVEL_DEBUG, true, true, false
+    @_instance?=new TLog TLog.LOGLEVEL_DEBUG, false, false, false
     @_instance
 
   @LOGLEVEL_FATAL = 0
