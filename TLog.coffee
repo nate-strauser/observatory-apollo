@@ -1,3 +1,11 @@
+# stub for testing, if we are in the test env Meteor won't be defined
+###
+if not Meteor? and require?
+  {Meteor, EJSON} = require './unit-tests/MeteorStubs.coffee'
+  Observatory = Observatory or= {logger: -> console.log "Observatory.logger called"}
+  __meteor_bootstrap__ = Meteor.__meteor_bootstrap__
+###
+
 #(exports ? this).TLog = TLog
 # Class that handles all the logging logic
 #
@@ -28,7 +36,7 @@ class TLog
           full_message: fullMsg
           module: "HTTP"
           timestamp: l.timestamp
-          ip: l.remoteAddress
+          ip: l.forwardedFor #l.remoteAddress
           elapsedTime: l.responseTime # e.g., response time for http or method running time for profiling functions
 
         # recording the result
@@ -46,7 +54,7 @@ class TLog
   # @param [Bool] want_to_print if true, log messages will be printed to the console as well
   #
   @getLogger:->
-    @_instance?=new TLog TLog.LOGLEVEL_DEBUG, false, false, false
+    @_instance?=new TLog TLog.LOGLEVEL_DEBUG, false, true, false
     @_instance
 
   @LOGLEVEL_FATAL = 0
@@ -67,35 +75,14 @@ class TLog
   ]
 
   constructor: (@_currentLogLevel, @_printToConsole, @_log_user = true, show_warning = true)->
-    @_logs = TLog._global_logs
-    if Meteor.isServer
-      # Hooking into connect middleware
-      __meteor_bootstrap__.app.use Observatory.logger #TLog.useragent
-      Meteor.publish '_observatory_logs',->
-        TLog._global_logs.find {}, {sort: {timestamp: -1}, limit:TLog.limit}
-      # TODO: make this configurable
-      TLog._global_logs.allow
-        insert: (uid)->
-          true
-        update: (uid)->
-          false
+    if TLog._instance? then throw new Error "Attempted to create another instance of the TLog"
 
-    if Meteor.isClient
-      Meteor.subscribe('_observatory_logs')
-    @warn("You should use TLog.getLogger(loglevel, want_to_print) method instead of a constructor! Constructor calls may be removed 
+    @_logs = TLog._global_logs
+
+    @warn("You should use TLog.getLogger(loglevel, want_to_print) method instead of a constructor! Constructor calls may be removed
       in the next versions of the package.") if show_warning
     @verbose "Creating logger with level #{TLog.LOGLEVEL_NAMES[@_currentLogLevel]}, print to console: #{@_printToConsole}, log user: #{@_log_user}", "Observatory"
 
-
-  # function to set who is allowed to remove the logs from the database
-  @allowRemove: (func)=>
-    tl = TLog.getLogger()
-    if Meteor.isServer
-      TLog._global_logs.allow
-        remove: (uid)=>
-          tl.warn "Setting allowRemove on the logger to #{func}", "Observatory"
-          if func then func uid else true
-    else tl.warn "Tried to set remove permissions to #{func} on the client", "Observatory"
 
   # Set options for a logger
   #
@@ -171,15 +158,15 @@ class TLog
 
   # low level full logging convenience
   # DOES NOT check current level to allow logging monitoring etc functions
-  _lowLevelLog: (loglevel, options, customOptions)->
+  _lowLevelLog: (loglevel, options, customOptions, fn)->
     #return if loglevel >= @_currentLogLevel
 
     ts = if options.timestamp_text then options.timestamp_text else @_ps(TLog._convertDate(options.timestamp)) + @_ps(TLog._convertTime(options.timestamp))
 
-    @_logs.insert
+    obj =
       isServer: options.isServer or false
       message: options.message
-      full_message: options.fullMessage
+      full_message: options.full_message
       module: options.module
       loglevel: loglevel
       timestamp_text: ts
@@ -189,48 +176,73 @@ class TLog
       elapsedTime: options.elapsedTime # e.g., response time for http or method running time for profiling functions
       customOptions: customOptions # anything else EJSONable that you want to store
 
-  # normal Meteor logging
-  _log: (msg, loglevel = TLog.LOGLEVEL_INFO, mdl) ->
-    if loglevel <= @_currentLogLevel
-      srv = false
-      if Meteor.isServer
-        srv = true
+    if fn
+      @_logs.insert obj, fn # calling this with callback is only useful for testing
+    else 
+      #console.dir @_logs
+      #console.dir obj
+      try
+        @_logs.insert obj
+        #console.dir obj
+      catch e
+        console.log "ERROR while inserting logs from TLog"
+        console.dir e.stack
+      
+      
 
-      uid = null
-      user = ''
-      if @_log_user
-        try
-          uid = Meteor.userId()
-          u = Meteor.users.findOne(uid) # TODO: check how it affects performance!
-          if u and u.username
-            user = u.username
-          else
-            if u and u.emails and u.emails[0]
-              user = u.emails[0].address
-            else
-              user = uid
-        catch err
+  # helper method to format a message from standard API methods
+  
+  # helper method to get userId
+  # TODO: think how to get to it if we are in publish()
+  # TODO: Needs testing!
+  _checkUser: ->
+    user = ''
+    try
+      uid = if this.userId? then this.userId else Meteor.userId()
+      u = Meteor.users.findOne(uid) # TODO: check how it affects performance!
+      if u and u.username
+        user = u.username
+      else
+        if u and u.emails and u.emails[0]
+          user = u.emails[0].address
+        else
+          user = uid
+    catch err
+    {user: user, uid: uid}
 
-      module = mdl
-      timestamp = new Date
-      ts = @_ps(TLog._convertDate(timestamp)) + @_ps(TLog._convertTime(timestamp))
-      full_message = if srv then ts + "[SERVER]" else ts + "[CLIENT]"
-      full_message+= if module then @_ps module else "[]"
-      full_message+= @_ps(TLog.LOGLEVEL_NAMES[loglevel]) #TODO: RANGE CHECK!!!
-      full_message+= "[#{user}]"
-      full_message+= ' ' + msg
-
-      options =
+  # prepare options object for logging
+  _prepareLogOptions: (msg, loglevel, module)->
+    srv = Meteor.isServer
+    {user, uid} = @_checkUser() if @_log_user
+    options =
         isServer: srv
         message: msg
-        module: mdl
-        timestamp: timestamp
-        timestamp_text: ts
-        full_message: full_message
+        module: module
+        timestamp: new Date
         uid: uid
+        user: user
+        loglevel: loglevel
+    options
 
+  # format message for logging based on the options object
+  # TODO: add colorization for HTML or ANSI
+  _formatLogMessage: (o, colorize = false)->
+    ts = @_ps(TLog._convertDate(o.timestamp)) + @_ps(TLog._convertTime(o.timestamp))
+    full_message = ts + if o.isServer then "[SERVER]" else "[CLIENT]"
+    full_message+= if o.module then @_ps o.module else "[]"
+    full_message+= @_ps(TLog.LOGLEVEL_NAMES[o.loglevel]) #TODO: RANGE CHECK!!!
+    full_message+= "[#{o.user}]"
+    full_message+= " #{o.message}"
+    full_message
+
+  # normal Meteor logging
+  # NOTE! --> killing timestamp text storage, formatting should be done during the presentation time
+  _log: (msg, loglevel = TLog.LOGLEVEL_INFO, mdl) ->
+    if loglevel <= @_currentLogLevel
+      options = @_prepareLogOptions msg, loglevel, mdl
+      options.full_message = @_formatLogMessage options
       @_lowLevelLog loglevel, options
-      console.log(full_message) if @_printToConsole
+      console.log(options.full_message) if @_printToConsole
 
   _convertTimestamp: (timestamp)->
     st = timestamp.getUTCDate() + '/' + timestamp.getUTCMonth() + '/'+timestamp.getUTCFullYear() + ' ' +
@@ -240,7 +252,7 @@ class TLog
     st = timestamp.getUTCDate() + '/' + timestamp.getUTCMonth() + '/'+timestamp.getUTCFullYear()
 
   @_convertTime: (timestamp, ms=true)->
-    ts = timestamp.getUTCHours()+ ':' + timestamp.getUTCMinutes() + ':' + timestamp.getUTCSeconds() 
+    ts = timestamp.getUTCHours()+ ':' + timestamp.getUTCMinutes() + ':' + timestamp.getUTCSeconds()
     ts += '.' + timestamp.getUTCMilliseconds() if ms
     ts
 
@@ -285,6 +297,6 @@ Inspect =
       properties.push prop  if typeof testObj[prop] isnt Inspect.TYPE_FUNCTION and typeof Inspect[prop] isnt Inspect.TYPE_FUNCTION
     properties
 
-#global.TLog = TLog
+module?.exports?.TLog = TLog
 (exports ? this).TLog = TLog
 (exports ? this).Inspect = Inspect
